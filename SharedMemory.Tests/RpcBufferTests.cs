@@ -75,9 +75,9 @@ namespace SharedMemoryTests
         {
             // Ensure a unique channel name
             var rpcName = $"rpc-{Guid.NewGuid()}";
-            var rpcMaster = new RpcBuffer(rpcName, bufferNodeCount: 2);
-            var input = Encoding.Unicode.GetBytes(new String('I', 1024));
-            var output = Encoding.Unicode.GetBytes(new String('O', 1024));
+            var rpcMaster = new RpcBuffer(rpcName, 2048, bufferNodeCount: 2);
+            var input = Encoding.Unicode.GetBytes(new String('I', 1024 * 2));
+            var output = Encoding.Unicode.GetBytes(new String('O', 1024 * 2));
             var rpcSlave = new RpcBuffer(rpcName,
                 (_, payload) => Task.Run(async () =>
                 {
@@ -108,7 +108,7 @@ namespace SharedMemoryTests
                 Assert.IsFalse(task.IsFaulted);
             }
 
-            var sendMessageCount = 1000;
+            var sendMessageCount = 200;
             var eval = Parallel.For(0, sendMessageCount, new ParallelOptions { MaxDegreeOfParallelism = 32 }, 
                 _ => LogIfFailed(Run()));
 
