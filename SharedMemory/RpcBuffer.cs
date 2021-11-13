@@ -588,7 +588,7 @@ namespace SharedMemory
 
             this.msgBufferLength = Convert.ToInt32(this.bufferCapacity) - protocolLength;
 
-            Task.Run(() =>
+            var readTask = new Task(() =>
             {
                 switch (protocolVersion)
                 {
@@ -596,7 +596,9 @@ namespace SharedMemory
                         ReadThreadV1();
                         break;
                 }
-            });
+            }, TaskCreationOptions.LongRunning);
+
+            readTask.Start();
         }
 
         object mutex = new object();
@@ -758,25 +760,23 @@ namespace SharedMemory
             }
 
             // Send the request packets
-            lock (lock_sendQ)
+            //lock (lock_sendQ)
             {
                 // Split message into correct packet size
                 int i = 0;
                 int left = msg?.Length ?? 0;
 
-                byte[] pMsg = null;
+                byte[] pMsg = new byte[msgBufferLength + protocolLength];
 
                 ushort totalPackets = ((msg?.Length ?? 0) == 0) ? (ushort)1 : Convert.ToUInt16(Math.Ceiling((double)msg.Length / (double)msgBufferLength));
                 ushort currentPacket = 1;
 
-                while (true)
+                while (currentPacket <= totalPackets)
                 {
                     if (WriteBuffer.ShuttingDown)
                     {
                         return false;
                     }
-
-                    pMsg = new byte[left > msgBufferLength ? msgBufferLength + protocolLength : left + protocolLength];
                     
                     // Writing protocol header
                     var header = new RpcProtocolHeaderV1
@@ -790,40 +790,27 @@ namespace SharedMemory
                     };
                     FastStructure.CopyTo(ref header, pMsg, 0);
 
-                    if (left > msgBufferLength)
-                    {
-                        // Writing payload
-                        if (msg != null && msg.Length > 0)
-                            Buffer.BlockCopy(msg, i, pMsg, protocolLength, msgBufferLength);
+                    var payloadLen = left > msgBufferLength ? msgBufferLength : left;
+                    var packetLen = payloadLen + protocolLength;
 
-                        left -= msgBufferLength;
-                        i += msgBufferLength;
-                    }
-                    else
-                    {
-                        // Writing last packet of payload
-                        if (msg != null && msg.Length > 0)
-                        {
-                            Buffer.BlockCopy(msg, i, pMsg, protocolLength, left);
-                        }
-
-                        left = 0;
-                    }
+                    // Writing payload
+                    if (msg != null && msg.Length > 0)
+                        Buffer.BlockCopy(msg, i, pMsg, protocolLength, payloadLen);
 
                     Statistics.StartWaitWrite();
                     var bytes = WriteBuffer.Write((ptr) =>
                     {
-                        FastStructure.WriteBytes(ptr, pMsg, 0, pMsg.Length);
-                        return pMsg.Length;
-                    }, 1000);
+                        FastStructure.WriteBytes(ptr, pMsg, 0, packetLen);
+                        return packetLen;
+                    }, timeout);
+                    Statistics.WritePacket(bytes > 0 ? payloadLen : 0);
 
-                    Statistics.WritePacket(bytes - protocolLength);
-
-                    if (left <= 0)
+                    if (bytes > 0)
                     {
-                        break;
+                        left -= payloadLen;
+                        i += payloadLen;
+                        currentPacket++;
                     }
-                    currentPacket++;
                 }
             }
 
@@ -832,7 +819,7 @@ namespace SharedMemory
 
         void ReadThreadV1()
         {
-            while(true && !ReadBuffer.ShuttingDown)
+            while(true && ReadBuffer != null && !ReadBuffer.ShuttingDown)
             {
                 if (Interlocked.Read(ref _disposed) == 1)
                     return;
@@ -992,6 +979,8 @@ namespace SharedMemory
 
             if (disposeManagedResources)
             {
+                Disposed = true;
+
                 if (WriteBuffer != null)
                 {
                     WriteBuffer.Dispose();
@@ -1010,8 +999,6 @@ namespace SharedMemory
                     masterMutex.Dispose();
                     masterMutex = null;
                 }
-
-                Disposed = true;
             }
         }
 

@@ -28,6 +28,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using SharedMemory;
 using System.Diagnostics;
+using System.Text;
 
 namespace SharedMemoryTests
 {
@@ -67,6 +68,56 @@ namespace SharedMemoryTests
         {
             Assert.ThrowsException<ArgumentOutOfRangeException>(() => new RpcBuffer(ipcName, 255));
             Assert.ThrowsException<ArgumentOutOfRangeException>(() => new RpcBuffer(ipcName, 1024*1024 + 1));
+        }
+
+        [TestMethod]
+        public void RPC_MasterCallsSlave_DroppingPackets()
+        {
+            // Ensure a unique channel name
+            var rpcName = $"rpc-{Guid.NewGuid()}";
+            var rpcMaster = new RpcBuffer(rpcName, bufferNodeCount: 2);
+            var input = Encoding.Unicode.GetBytes(new String('I', 1024));
+            var output = Encoding.Unicode.GetBytes(new String('O', 1024));
+            var rpcSlave = new RpcBuffer(rpcName,
+                (_, payload) => Task.Run(async () =>
+                {
+                    await Task.Delay(0);
+                    return output;
+                })
+            );
+
+            var resCount = 0;
+            var sendCount = 0;
+            async Task Run()
+            {
+                lock (rpcName)
+                {
+                    sendCount++;
+                }
+                var result = await rpcMaster.RemoteRequestAsync(input, timeoutMs: -1);
+                Assert.IsTrue(result.Success);
+                lock (rpcName)
+                {
+                    resCount++;
+                }
+            }
+
+            void LogIfFailed(Task task)
+            {
+                task.Wait();
+                Assert.IsFalse(task.IsFaulted);
+            }
+
+            var sendMessageCount = 1000;
+            var eval = Parallel.For(0, sendMessageCount, new ParallelOptions { MaxDegreeOfParallelism = 32 }, 
+                _ => LogIfFailed(Run()));
+
+            //Thread.Sleep(5000);
+
+            Assert.IsTrue(eval.IsCompleted);
+
+            Assert.AreEqual(sendMessageCount, sendCount);
+            Assert.AreEqual(sendMessageCount, resCount);
         }
 
         [TestMethod]

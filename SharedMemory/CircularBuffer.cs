@@ -417,7 +417,7 @@ namespace SharedMemory
                 int blockIndex = _nodeHeader->WriteEnd;
                 node = this[blockIndex];
 #pragma warning disable 0420 // ignore ref to volatile warning - Interlocked API
-                if (Interlocked.CompareExchange(ref node->DoneWrite, 0, 1) != 1)
+                if (Interlocked.CompareExchange(ref node->DoneWrite, 0, 1) == 0)
                 {
                     // If we get here then another thread either another thread
                     // has already moved the write index or we have moved forward 
@@ -634,7 +634,7 @@ namespace SharedMemory
                 int blockIndex = _nodeHeader->ReadEnd;
                 node = this[blockIndex];
 #pragma warning disable 0420 // ignore ref to volatile warning - Interlocked API
-                if (Interlocked.CompareExchange(ref node->DoneRead, 0, 1) != 1)
+                if (Interlocked.CompareExchange(ref node->DoneRead, 0, 1) == 0)
                 {
                     // If we get here then another read thread has already moved the pointer
                     // or we have moved ReadEnd as far forward as we can
