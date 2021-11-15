@@ -127,6 +127,10 @@ namespace SharedMemory
         /// </summary>
         public bool IsSuccess { get; internal set; }
         /// <summary>
+        /// Has all the data been read
+        /// </summary>
+        public bool IsDataComplete { get; internal set; }
+        /// <summary>
         /// When the request was created
         /// </summary>
         public DateTime Created { get; } = DateTime.Now;
@@ -414,6 +418,7 @@ namespace SharedMemory
     {
         private Mutex masterMutex;
         private long _disposed = 0;
+        private Thread readerThread;
         
         /// <summary>
         /// Whether the RpcBuffer has been disposed
@@ -588,7 +593,7 @@ namespace SharedMemory
 
             this.msgBufferLength = Convert.ToInt32(this.bufferCapacity) - protocolLength;
 
-            var readTask = new Task(() =>
+            readerThread = new Thread(new ThreadStart(() =>
             {
                 switch (protocolVersion)
                 {
@@ -596,9 +601,20 @@ namespace SharedMemory
                         ReadThreadV1();
                         break;
                 }
-            }, TaskCreationOptions.LongRunning);
+            }));
+            readerThread.Start();
 
-            readTask.Start();
+            //var readTask = new Task(() =>
+            //{
+            //    switch (protocolVersion)
+            //    {
+            //        case RpcProtocol.V1:
+            //            ReadThreadV1();
+            //            break;
+            //    }
+            //}, TaskCreationOptions.LongRunning);
+
+            //readTask.Start();
         }
 
         object mutex = new object();
@@ -635,9 +651,9 @@ namespace SharedMemory
             var t = new Task(async () =>
             {
                 await SendMessage(request, args, timeoutMs).ConfigureAwait(false);
-            });
+            }, TaskCreationOptions.LongRunning);
             t.Start();
-            
+
             if (!request.ResponseReady.WaitOne(timeoutMs))
             {
                 // Timed out
@@ -721,7 +737,19 @@ namespace SharedMemory
 
                 if (request != null)
                 {
-                    await Task.Run(() =>
+                    //await Task.Run(() =>
+                    //{
+                    //    if (!request.ResponseReady.WaitOne(timeout))
+                    //    {
+                    //        result = new RpcResponse(false, null);
+                    //    }
+                    //    else
+                    //    {
+                    //        result = new RpcResponse(request.IsSuccess, request.Data);
+                    //    }
+                    //}).ConfigureAwait(true);
+
+                    var t = new Task(() =>
                     {
                         if (!request.ResponseReady.WaitOne(timeout))
                         {
@@ -731,7 +759,9 @@ namespace SharedMemory
                         {
                             result = new RpcResponse(request.IsSuccess, request.Data);
                         }
-                    }).ConfigureAwait(false);
+                    }, TaskCreationOptions.LongRunning);
+                    t.Start();
+                    await t.ConfigureAwait(false);
                 }
 
                 return result;
@@ -759,25 +789,21 @@ namespace SharedMemory
                 return false;
             }
 
-            // Send the request packets
-            //lock (lock_sendQ)
+            // Split message into correct packet size
+            int i = 0;
+            int left = msg?.Length ?? 0;
+
+            ushort totalPackets = (left == 0) ? (ushort)1 : Convert.ToUInt16(Math.Ceiling((double)msg.Length / (double)msgBufferLength));
+            ushort currentPacket = 1;
+
+            while (currentPacket <= totalPackets && WriteBuffer != null && !WriteBuffer.ShuttingDown)
             {
-                // Split message into correct packet size
-                int i = 0;
-                int left = msg?.Length ?? 0;
-
-                byte[] pMsg = new byte[msgBufferLength + protocolLength];
-
-                ushort totalPackets = ((msg?.Length ?? 0) == 0) ? (ushort)1 : Convert.ToUInt16(Math.Ceiling((double)msg.Length / (double)msgBufferLength));
-                ushort currentPacket = 1;
-
-                while (currentPacket <= totalPackets)
+                Statistics.StartWaitWrite();
+                var sentBytes = WriteBuffer.Write((ptr) =>
                 {
-                    if (WriteBuffer.ShuttingDown)
-                    {
-                        return false;
-                    }
-                    
+                    var payloadLen = left > msgBufferLength ? msgBufferLength : left;
+                    var packetLen = payloadLen + protocolLength;
+
                     // Writing protocol header
                     var header = new RpcProtocolHeaderV1
                     {
@@ -788,33 +814,24 @@ namespace SharedMemory
                         PayloadSize = msg?.Length ?? 0,
                         ResponseId = responseMsgId
                     };
-                    FastStructure.CopyTo(ref header, pMsg, 0);
-
-                    var payloadLen = left > msgBufferLength ? msgBufferLength : left;
-                    var packetLen = payloadLen + protocolLength;
+                    //FastStructure.CopyTo(ref header, pMsg, 0);
+                    FastStructure.WriteBytes(ptr, FastStructure.ToBytes(ref header), 0, protocolLength);
 
                     // Writing payload
-                    if (msg != null && msg.Length > 0)
-                        Buffer.BlockCopy(msg, i, pMsg, protocolLength, payloadLen);
+                    if(msg != null)
+                        FastStructure.WriteBytes(ptr + protocolLength, msg, i, payloadLen);
 
-                    Statistics.StartWaitWrite();
-                    var bytes = WriteBuffer.Write((ptr) =>
-                    {
-                        FastStructure.WriteBytes(ptr, pMsg, 0, packetLen);
-                        return packetLen;
-                    }, timeout);
-                    Statistics.WritePacket(bytes > 0 ? payloadLen : 0);
+                    left -= payloadLen;
+                    i += payloadLen;
+                    currentPacket++;
 
-                    if (bytes > 0)
-                    {
-                        left -= payloadLen;
-                        i += payloadLen;
-                        currentPacket++;
-                    }
-                }
+                    return packetLen;
+                }, timeout);
+
+                Statistics.WritePacket(sentBytes);
             }
 
-            return true;
+            return currentPacket > totalPackets;
         }
 
         void ReadThreadV1()
@@ -826,14 +843,13 @@ namespace SharedMemory
 
                 Statistics.StartWaitRead();
 
-                ReadBuffer.Read((ptr) =>
+                RpcRequest request = null;
+                _ = ReadBuffer.Read((ptr) =>
                 {
-                    int readLength = 0;
                     var header = FastStructure<RpcProtocolHeaderV1>.PtrToStructure(ptr);
-                    ptr = ptr + protocolLength;
-                    readLength += protocolLength;
+                    ptr += protocolLength;
 
-                    RpcRequest request = null;
+                    request = null;
                     if (header.MsgType == MessageType.RpcResponse || header.MsgType == MessageType.ErrorInRpc)
                     {
                         if (!Requests.TryGetValue(header.ResponseId, out request))
@@ -842,12 +858,15 @@ namespace SharedMemory
                             Statistics.DiscardResponse(header.ResponseId);
                             return protocolLength;
                         }
+
+                        request.MsgType = header.MsgType;
                     }
                     else
                     {
                         request = IncomingRequests.GetOrAdd(header.MsgId, new RpcRequest
                         {
-                            MsgId = header.MsgId
+                            MsgId = header.MsgId,
+                            MsgType = header.MsgType,
                         });
                     }
 
@@ -863,49 +882,57 @@ namespace SharedMemory
 
                         int index = msgBufferLength * (header.CurrentPacket - 1);
                         FastStructure.ReadBytes(request.Data, ptr, index, packetSize);
-                        readLength += packetSize;
                     }
 
                     if (header.CurrentPacket == header.TotalPackets)
                     {
-                        if (header.MsgType == MessageType.RpcResponse || header.MsgType == MessageType.ErrorInRpc)
+                        request.IsDataComplete = true;
+
+                        if (request.MsgType == MessageType.RpcResponse || request.MsgType == MessageType.ErrorInRpc)
                         {
-                            Requests.TryRemove(request.MsgId, out RpcRequest removed);
+                            var res = Requests.TryRemove(request.MsgId, out RpcRequest removed);
+                            Debug.Assert(res);
                         }
                         else
                         {
-                            IncomingRequests.TryRemove(request.MsgId, out RpcRequest removed);
+                            var res = IncomingRequests.TryRemove(request.MsgId, out RpcRequest removed);
+                            Debug.Assert(res);
                         }
-
-                        // Full message is ready
-                        var watching = Stopwatch.StartNew();
-                        Task.Run(async () =>
-                        {
-                            Statistics.MessageReceived(header.MsgType, request.Data?.Length ?? 0);
-
-                            if (header.MsgType == MessageType.RpcResponse)
-                            {
-                                request.IsSuccess = true;
-                                request.ResponseReady.Set();
-                            }
-                            else if (header.MsgType == MessageType.ErrorInRpc)
-                            {
-                                request.IsSuccess = false;
-                                request.ResponseReady.Set();
-                            }
-                            else if (header.MsgType == MessageType.RpcRequest)
-                            {
-                                await ProcessCallHandler(request).ConfigureAwait(false);
-                            }
-                        });
                     }
 
                     Statistics.ReadPacket(packetSize);
 
                     return protocolLength + packetSize;
-                }, 500);
+                }, -1);
+
+                if (request != null && request.IsDataComplete)
+                {
+                    // Full message is ready
+                    Statistics.MessageReceived(request.MsgType, request.Data?.Length ?? 0);
+
+                    if (request.MsgType == MessageType.RpcResponse)
+                    {
+                        request.IsSuccess = true;
+                        request.ResponseReady.Set();
+                    }
+                    else if (request.MsgType == MessageType.ErrorInRpc)
+                    {
+                        request.IsSuccess = false;
+                        request.ResponseReady.Set();
+                    }
+                    else if (request.MsgType == MessageType.RpcRequest)
+                    {
+                        var t = new Task(async () =>
+                        {
+                            await ProcessCallHandler(request).ConfigureAwait(false);
+                        }, TaskCreationOptions.LongRunning | TaskCreationOptions.PreferFairness);
+                        t.Start();
+                    }
+                }
             }
         }
+
+        int tmp = 0, tmp2 = 0, tmp3 = 0;
 
         async Task ProcessCallHandler(RpcRequest request)
         {
@@ -928,8 +955,11 @@ namespace SharedMemory
                 }
                 else if (AsyncRemoteCallHandlerWithResult != null)
                 {
+                    //Debug.WriteLine($"1: {tmp++}");
                     var result = await AsyncRemoteCallHandlerWithResult(request.MsgId, request.Data).ConfigureAwait(false);
+                    //Debug.WriteLine($"2: {tmp2++}");
                     await SendMessage(MessageType.RpcResponse, CreateMessageRequest(), result, request.MsgId).ConfigureAwait(false);
+                    //Debug.WriteLine($"3: {tmp3++}");
                 }
             }
             catch
@@ -998,6 +1028,12 @@ namespace SharedMemory
                     masterMutex.Close();
                     masterMutex.Dispose();
                     masterMutex = null;
+                }
+
+                if(readerThread != null)
+                {
+                    readerThread.Join();
+                    readerThread = null;
                 }
             }
         }

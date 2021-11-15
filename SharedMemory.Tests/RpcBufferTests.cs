@@ -75,20 +75,20 @@ namespace SharedMemoryTests
         {
             // Ensure a unique channel name
             var rpcName = $"rpc-{Guid.NewGuid()}";
-            var rpcMaster = new RpcBuffer(rpcName, 2048, bufferNodeCount: 2);
-            var input = Encoding.Unicode.GetBytes(new String('I', 1024 * 2));
-            var output = Encoding.Unicode.GetBytes(new String('O', 1024 * 2));
+            var rpcMaster = new RpcBuffer(rpcName, 2048, bufferNodeCount: 50);
+            var input = Encoding.Unicode.GetBytes(new String('I', 512 * 10));
+            var output = Encoding.Unicode.GetBytes(new String('O', 512 * 10));
             var rpcSlave = new RpcBuffer(rpcName,
                 (_, payload) => Task.Run(async () =>
                 {
-                    await Task.Delay(0);
+                    await Task.Delay(10);
                     return output;
                 })
             );
 
             var resCount = 0;
             var sendCount = 0;
-            async Task Run()
+            async Task GetReplyAndVerifyTask()
             {
                 lock (rpcName)
                 {
@@ -101,20 +101,20 @@ namespace SharedMemoryTests
                     resCount++;
                 }
             }
-
-            void LogIfFailed(Task task)
-            {
-                task.Wait();
-                Assert.IsFalse(task.IsFaulted);
-            }
-
             var sendMessageCount = 200;
-            var eval = Parallel.For(0, sendMessageCount, new ParallelOptions { MaxDegreeOfParallelism = 32 }, 
-                _ => LogIfFailed(Run()));
 
-            //Thread.Sleep(5000);
+            var sendTasks = Enumerable.Range(0, sendMessageCount).Select(s => GetReplyAndVerifyTask());
 
-            Assert.IsTrue(eval.IsCompleted);
+            var t2 = Task.WhenAll(sendTasks);
+            t2.Wait();
+
+            //var eval = Parallel.For(0, sendMessageCount, new ParallelOptions { MaxDegreeOfParallelism = 32 }, 
+            //   _ => RunAndTest());
+
+            Assert.IsTrue(t2.IsCompleted);
+            Assert.IsFalse(t2.IsFaulted);
+
+            //Assert.IsTrue(eval.IsCompleted);
 
             Assert.AreEqual(sendMessageCount, sendCount);
             Assert.AreEqual(sendMessageCount, resCount);
